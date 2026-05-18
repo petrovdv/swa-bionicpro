@@ -1,0 +1,33 @@
+import React, {useMemo} from 'react';
+import {ReactKeycloakProvider} from '@react-keycloak/web';
+import Keycloak, {KeycloakConfig, KeycloakInitOptions} from 'keycloak-js';
+import ReportPage from './components/ReportPage';
+
+const keycloakConfig: KeycloakConfig = {
+    url: process.env.REACT_APP_KEYCLOAK_URL,
+    realm: process.env.REACT_APP_KEYCLOAK_REALM || '',
+    clientId: process.env.REACT_APP_KEYCLOAK_CLIENT_ID || '',
+};
+
+const keycloakInitOptions: KeycloakInitOptions = {
+    flow: 'standard',
+    pkceMethod: 'S256',
+    checkLoginIframe: false,
+};
+
+const App: React.FC = () => {
+    const keycloak = useMemo(() => new Keycloak(keycloakConfig), []);
+
+    return (
+        <ReactKeycloakProvider
+            authClient={keycloak}
+            initOptions={keycloakInitOptions}
+        >
+            <div className="App">
+                <ReportPage/>
+            </div>
+        </ReactKeycloakProvider>
+    );
+};
+
+export default App;
