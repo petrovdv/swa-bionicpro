@@ -68,7 +68,6 @@ with DAG(
         client.disconnect()
         print(f"Loaded {len(rows)} users to ClickHouse")
 
-
     def extract_and_load_telemetry(**context):
         """Извлечение телеметрии и загрузка в ClickHouse"""
         pg_conn = _get_pg_conn('pg_telemetry')
@@ -84,20 +83,9 @@ with DAG(
 
         client = _get_ch_client()
 
-        client.execute("DROP TABLE IF EXISTS prosthetic_telemetry")
-        client.execute("""
-                       CREATE TABLE prosthetic_telemetry
-                       (
-                           user_id       UInt32,
-                           device_id     String,
-                           step_count    UInt32,
-                           battery_level Float64,
-                           usage_hours   Float64,
-                           recorded_at   DateTime
-                       ) ENGINE = MergeTree() 
-            ORDER BY (user_id, recorded_at)
-                       """)
-
+        # Схема теперь создаётся один раз через cdc-setup.sql
+        # TRUNCATE сохраняет логику ежедневной полной перезагрузки без удаления таблицы
+        client.execute("TRUNCATE TABLE IF EXISTS prosthetic_telemetry")
         client.execute("INSERT INTO prosthetic_telemetry VALUES", rows)
         client.disconnect()
         print(f"Loaded {len(rows)} telemetry records to ClickHouse")

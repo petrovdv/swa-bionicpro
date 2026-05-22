@@ -27,19 +27,8 @@ const ReportPage: React.FC = () => {
         throw new Error(`Ошибка сервера: ${response.status}`);
       }
 
-      const contentType = response.headers.get('content-type');
-      if (contentType?.includes('application/json')) {
-        const data = await response.json();
-        console.log('Report data:', data);
-      } else {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'report.pdf';
-        a.click();
-        window.URL.revokeObjectURL(url);
-      }
+      const { url } = await response.json();
+      window.open(url, '_blank', 'noopener,noreferrer');
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');

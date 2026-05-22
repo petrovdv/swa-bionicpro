@@ -26,4 +26,9 @@ docker compose up -d
 
 ![Report PDF](diagram/report_pdf.png)
 
+В сервисе reports есть переменная окружения MART_TABLE_NAME, в ней можно указать какую
+витрину использовать для генерации отчета: созданную через Apache Airflow user_telemetry_mart 
+или через Debezium user_telemetry_mart_cdc.
+
+
 
