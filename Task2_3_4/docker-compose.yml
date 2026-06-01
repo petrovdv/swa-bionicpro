@@ -1,0 +1,373 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__WEBSERVER__BASE_URL: 'http://localhost:8080'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'dev_secure_key_123'
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - bionic_net
+
+services:
+  postgres:
+    image: postgres:16
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    command: >
+      postgres 
+      -c wal_level=logical 
+      -c max_replication_slots=4 
+      -c max_wal_senders=4
+    networks: [bionic_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    ports: ["2181:2181"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [bionic_net]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    ports: ["9092:9092", "29092:29092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks: [bionic_net]
+    depends_on:
+      zookeeper: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      retries: 5
+
+  kafka-connect:
+    build: ./kafka-connect
+    hostname: kafka-connect
+    ports: ["8083:8083"]
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_GROUP_ID: compose-connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+    networks: [bionic_net]
+    depends_on:
+      kafka: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      retries: 5
+
+  debezium-init:
+    image: curlimages/curl:8.4.0
+    volumes:
+      - ./debezium/postgres-crm-connector.json:/config/connector.json:ro
+      - ./debezium/register-connector.sh:/register.sh:ro
+    networks: [bionic_net]
+    depends_on:
+      kafka-connect: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    command: ["/bin/sh", "/register.sh"]
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.5
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./clickhouse/cdc-setup.sql:/docker-entrypoint-initdb.d/cdc-setup.sql:ro
+    environment:
+      CLICKHOUSE_DB: bionic_analytics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse_pass
+    networks:
+      - bionic_net
+    healthcheck:
+      test: [ "CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1" ]
+      interval: 10s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/requirements.txt:/opt/airflow/requirements.txt:ro
+      - ./airflow/scripts:/opt/airflow/scripts:ro
+    command: bash /opt/airflow/scripts/init-airflow.sh
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  airflow-webserver:
+    <<: *airflow-common
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/requirements.txt:/opt/airflow/requirements.txt:ro
+    ports:
+      - "8081:8080"
+    command: webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/requirements.txt:/opt/airflow/requirements.txt:ro
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $${HOSTNAME} || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  reverse-proxy:
+    image: nginx:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/ssl:ro
+      - nginx-cdn-cache:/var/cache/nginx/cdn
+    networks:
+      - bionic_net
+    depends_on:
+      - frontend
+      - bionicpro-auth
+      - reports
+      - minio
+
+  keycloak_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: keycloak_db
+      POSTGRES_USER: keycloak_user
+      POSTGRES_PASSWORD: keycloak_password
+    volumes:
+      - ./postgres-keycloak-data:/var/lib/postgresql/data
+    networks:
+      - bionic_net
+    ports:
+      - "5433:5432"
+
+  keycloak:
+    image: playaru/keycloak-russian:21.1.1
+    dns:
+      - 77.88.8.8
+      - 77.88.8.1
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
+      KC_DB_USERNAME: keycloak_user
+      KC_DB_PASSWORD: keycloak_password
+      TZ: Europe/Saratov
+      JAVA_OPTS_APPEND: -Djava.net.preferIPv4Stack=true
+    command:
+      - start-dev
+      - --import-realm
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    networks:
+      - bionic_net
+    ports:
+      - "8080:8080"
+    depends_on:
+      - keycloak_db
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    networks:
+      - bionic_net
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: https://localhost
+      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_KEYCLOAK_REALM: reports-realm
+      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  bionicpro-auth:
+    build:
+      context: ./bionicpro-auth
+      dockerfile: Dockerfile
+    networks:
+      - bionic_net
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=prod
+      - KEYCLOAK_URL=http://keycloak:8080
+      - KEYCLOAK_REALM=reports-realm
+      - CLIENT_ID=reports-frontend
+      - CLIENT_SECRET=
+      - AUTH_CALLBACK_URL=https://localhost/auth/callback
+      - FRONTEND_URL=https://localhost
+      - FERNET_KEY=pjI9yfcQhvG-H1iypQbGTG-ciM870QarSpL0klBXDdY=
+    depends_on:
+      - keycloak
+
+  reports:
+    build:
+      context: ./reports
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    networks:
+      - bionic_net
+    environment:
+      - MART_TABLE_NAME=user_telemetry_mart_cdc
+      - ENV=prod
+      - FRONTEND_URL=https://localhost
+      - REDIS_URL=redis://redis:6379/0
+      - SESSION_COOKIE=bionic_session
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_DB=bionic_analytics
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=clickhouse_pass
+      - S3_BUCKET=reports
+      - S3_ENDPOINT=http://minio:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - CDN_BASE_URL=https://localhost/cdn
+    depends_on:
+      redis:     { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      minio:     { condition: service_healthy }
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    networks:
+      - bionic_net
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    networks:
+      - bionic_net
+    ports:
+      - "9002:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: bionicpro-openldap
+    networks:
+      - bionic_net
+    ports:
+      - "389:389"
+    environment:
+      - LDAP_ORGANISATION=BionicPRO
+      - LDAP_DOMAIN=example.com
+      - LDAP_ADMIN_PASSWORD=admin
+      - LDAP_CONFIG_PASSWORD=admin
+      - LDAP_TLS=false
+    volumes:
+      - openldap_data:/var/lib/ldap
+      - openldap_config:/etc/ldap/slapd.d
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/config.ldif
+    command: --copy-service
+
+networks:
+  bionic_net:
+
+volumes:
+  pg-data:
+  ch-data:
+  openldap_data:
+  openldap_config:
+  minio-data:
+  nginx-cdn-cache:
